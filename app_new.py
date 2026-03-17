@@ -93,10 +93,24 @@ st.image(image, caption="上传的商品图片", use_container_width=True)
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 第一步：BLIP 生成商品描述
+# 第一步：BLIP 生成商品描述（带提示词，避免生成 ...............）
 # ---------------------------------------------------------------------------
+# 可在此修改第一步的提示词，引导 BLIP 生成更准确的商品描述
+blip_prompt = st.text_input(
+    "第一步提示词（引导 BLIP 生成描述，留空则用默认）",
+    value="a photography of",
+    placeholder="例如: a photography of / product:",
+    help="无提示词时 BLIP 可能只输出点或空白，建议保留默认。",
+)
+if not blip_prompt or not blip_prompt.strip():
+    blip_prompt = "a photography of"
+
 with st.spinner("正在生成商品描述（BLIP 微调模型）..."):
-    inputs = blip_processor(images=image, return_tensors="pt").to(device)
+    inputs = blip_processor(
+        images=image,
+        text=blip_prompt,
+        return_tensors="pt",
+    ).to(device)
     caption_ids = blip_model.generate(
         **inputs,
         max_new_tokens=50,
@@ -104,7 +118,13 @@ with st.spinner("正在生成商品描述（BLIP 微调模型）..."):
         early_stopping=True,
     )
     caption = blip_processor.decode(caption_ids[0], skip_special_tokens=True).strip()
-    product_desc = caption if caption else "商品"
+    # 去掉与提示词相同的前缀，只保留实际描述
+    if caption.lower().startswith(blip_prompt.lower().strip()):
+        caption = caption[len(blip_prompt.strip()) :].strip()
+    # 若仍为空或全是点/无意义，用兜底
+    if not caption or all(c in ".\u00b7\u2022 " for c in caption.replace(" ", "")):
+        caption = "商品"
+    product_desc = caption
 
 st.subheader("第一步：商品描述 (BLIP Image Captioning)")
 st.success(f"描述: **{product_desc}**")
@@ -141,4 +161,3 @@ with st.expander("查看技术逻辑 (Technical Logic)"):
     st.write("1. **BLIP（微调）**: Step1 在时尚商品数据上微调，从图片生成商品描述。")
     st.write(f"2. **Bridge**: 将描述「{product_desc}」按 Step2 格式构造 Product + Description + Ad。")
     st.write("3. **GPT-2（微调）**: Step2 在 Product-Descriptions-and-Ads 上微调，续写广告文案。")
-   
