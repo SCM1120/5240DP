@@ -1,11 +1,17 @@
 """
-ISOM5240 智能零售营销助手（新版本）
-流程：商品图片 → BLIP 图像描述 → GPT-2 广告文案生成
-运行：streamlit run app_new.py
+ISOM5240 智能零售营销助手（独立新文件）
+使用 Step1 微调 BLIP + Step2 微调 GPT-2。
+流程：商品图片 → BLIP 描述 → GPT-2 广告文案
+运行：streamlit run app_streamlit.py
 """
 
 import streamlit as st
-from transformers import pipeline, BlipProcessor, BlipForConditionalGeneration
+from transformers import (
+    BlipProcessor,
+    BlipForConditionalGeneration,
+    GPT2Tokenizer,
+    GPT2LMHeadModel,
+)
 from PIL import Image
 import torch
 
@@ -18,28 +24,58 @@ st.set_page_config(
 )
 
 st.title("🛍️ 智能零售营销助手")
-st.write("上传一张商品图片，AI 将自动生成商品描述并创作广告词。")
+st.write("上传商品图片，使用你训练的 BLIP + GPT-2 生成描述与广告文案。")
 
 # ---------------------------------------------------------------------------
-# 模型配置与加载
+# 模型配置（与 step1 / step2 笔记本一致）
 # ---------------------------------------------------------------------------
-BLIP_MODEL = "SCM1120/blip-fashion-finetuned"  # 可改为 "Salesforce/blip-image-captioning-base"
+BLIP_REPO = "SCM1120/blip-fashion-finetuned"
+GPT2_REPO = "SCM1120/gpt2-ad-finetuned"
 
 
 @st.cache_resource
 def load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    processor = BlipProcessor.from_pretrained(BLIP_MODEL)
-    blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_MODEL).to(device)
-    text_generator = pipeline(
-        "text-generation",
-        model="gpt2",
-        device=0 if device == "cuda" else -1,
-    )
-    return processor, blip_model, text_generator, device
+
+    blip_processor = BlipProcessor.from_pretrained(BLIP_REPO)
+    blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_REPO).to(device)
+
+    gpt2_tokenizer = GPT2Tokenizer.from_pretrained(GPT2_REPO)
+    gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+    gpt2_tokenizer.padding_side = "left"
+    gpt2_model = GPT2LMHeadModel.from_pretrained(GPT2_REPO).to(device)
+
+    return blip_processor, blip_model, gpt2_tokenizer, gpt2_model, device
 
 
-processor, blip_model, text_generator, device = load_models()
+def clean_ad_text(raw: str) -> str:
+    """只保留「Ad:」后的内容，去掉无意义的 Price/Color/Size 行，取前几句。"""
+    if not raw or not raw.strip():
+        return ""
+    if "Ad:" in raw:
+        raw = raw.split("Ad:")[-1].strip()
+    lines = []
+    for line in raw.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        if line.endswith(":") and len(line) < 30:
+            continue
+        lines.append(line)
+    merged = " ".join(lines)
+    for sep in (". ", "。", "\n"):
+        merged = merged.replace(sep, " <<S>> ")
+    parts = [p.strip() for p in merged.split(" <<S>> ") if len(p.strip()) > 10][:3]
+    result = " ".join(parts).strip()
+    if not result:
+        result = " ".join(lines[:3]).strip() or raw.strip()[:400]
+    return result
+
+
+# ---------------------------------------------------------------------------
+# 加载模型
+# ---------------------------------------------------------------------------
+blip_processor, blip_model, gpt2_tokenizer, gpt2_model, device = load_models()
 
 # ---------------------------------------------------------------------------
 # 上传与展示
@@ -52,51 +88,57 @@ uploaded_file = st.file_uploader(
 if uploaded_file is None:
     st.stop()
 
-image = Image.open(uploaded_file)
+image = Image.open(uploaded_file).convert("RGB")
 st.image(image, caption="上传的商品图片", use_container_width=True)
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 第一步：BLIP 图像描述
+# 第一步：BLIP 生成商品描述
 # ---------------------------------------------------------------------------
-with st.spinner("正在生成商品描述..."):
-    image_rgb = image.convert("RGB")
-    inputs = processor(images=image_rgb, return_tensors="pt").to(device)
-    out = blip_model.generate(**inputs, max_new_tokens=50)
-    caption = processor.decode(out[0], skip_special_tokens=True).strip()
+with st.spinner("正在生成商品描述（BLIP 微调模型）..."):
+    inputs = blip_processor(images=image, return_tensors="pt").to(device)
+    caption_ids = blip_model.generate(
+        **inputs,
+        max_new_tokens=50,
+        num_beams=3,
+        early_stopping=True,
+    )
+    caption = blip_processor.decode(caption_ids[0], skip_special_tokens=True).strip()
     product_desc = caption if caption else "商品"
 
 st.subheader("第一步：商品描述 (BLIP Image Captioning)")
 st.success(f"描述: **{product_desc}**")
 
 # ---------------------------------------------------------------------------
-# 第二步：GPT-2 广告文案生成
+# 第二步：GPT-2 生成广告文案
 # ---------------------------------------------------------------------------
-with st.spinner("正在创作广告文案..."):
-    prompt = (
-        "The following is a creative advertisement for a professional retail product.\n"
-        f"Product: {product_desc}\n"
-        "Ad Copy:"
-    )
-    result = text_generator(
-        prompt,
-        max_length=100,
-        num_return_sequences=1,
-        truncation=True,
-        pad_token_id=50256,
-    )
-    full_text = result[0]["generated_text"]
-    ad_copy = full_text.replace(prompt, "").strip()
+with st.spinner("正在创作广告文案（GPT-2 微调模型）..."):
+    prompt = f"Product: {product_desc}\nDescription: {product_desc}\nAd:"
+    inputs = gpt2_tokenizer(prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = gpt2_model.generate(
+            **inputs,
+            max_new_tokens=100,
+            do_sample=True,
+            temperature=0.7,
+            top_p=0.9,
+            repetition_penalty=1.3,
+            pad_token_id=gpt2_tokenizer.eos_token_id,
+        )
+    full_text = gpt2_tokenizer.decode(outputs[0], skip_special_tokens=True)
+    ad_copy = clean_ad_text(full_text)
 
 st.subheader("第二步：广告生成 (Ad Generation)")
-st.info(ad_copy if ad_copy else "正在努力构思中...")
+if ad_copy:
+    st.info(ad_copy)
+else:
+    st.warning("本次未生成有效文案，请换一张商品图或稍后重试。")
 
 # ---------------------------------------------------------------------------
 # 技术逻辑说明
 # ---------------------------------------------------------------------------
 with st.expander("查看技术逻辑 (Technical Logic)"):
-    st.write(
-        "1. **Vision-Language (BLIP)**: 使用微调后的 BLIP 模型从商品图像生成描述文本。"
-    )
-    st.write(f"2. **NLP Bridge**: 将描述「{product_desc}」作为上下文输入给 GPT-2。")
-    st.write("3. **Generative AI**: 通过自回归预测生成后续营销文本。")
+    st.write("1. **BLIP（微调）**: Step1 在时尚商品数据上微调，从图片生成商品描述。")
+    st.write(f"2. **Bridge**: 将描述「{product_desc}」按 Step2 格式构造 Product + Description + Ad。")
+    st.write("3. **GPT-2（微调）**: Step2 在 Product-Descriptions-and-Ads 上微调，续写广告文案。")
+   
