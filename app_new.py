@@ -100,4 +100,3 @@ with st.expander("查看技术逻辑 (Technical Logic)"):
     )
     st.write(f"2. **NLP Bridge**: 将描述「{product_desc}」作为上下文输入给 GPT-2。")
     st.write("3. **Generative AI**: 通过自回归预测生成后续营销文本。")
-
