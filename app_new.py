@@ -1,14 +1,15 @@
 """
 ISOM5240 智能零售营销助手（独立新文件）
-使用 Step1 微调 BLIP + Step2 微调 GPT-2。
-流程：商品图片 → BLIP 描述 → GPT-2 广告文案
+使用 nlpconnect/vit-gpt2-image-captioning（图像描述）+ Step2 微调 GPT-2（广告文案）。
+流程：商品图片 → ViT-GPT2 描述 → GPT-2 广告文案
 运行：streamlit run app_streamlit.py
 """
 
 import streamlit as st
 from transformers import (
-    BlipProcessor,
-    BlipForConditionalGeneration,
+    VisionEncoderDecoderModel,
+    ViTImageProcessor,
+    AutoTokenizer,
     GPT2Tokenizer,
     GPT2LMHeadModel,
 )
@@ -24,28 +25,31 @@ st.set_page_config(
 )
 
 st.title("🛍️ 智能零售营销助手")
-st.write("上传商品图片，使用你训练的 BLIP + GPT-2 生成描述与广告文案。")
+st.write("上传商品图片，使用 ViT-GPT2 生成描述，再由微调 GPT-2 生成广告文案。")
 
 # ---------------------------------------------------------------------------
-# 模型配置（与 step1 / step2 笔记本一致）
+# 模型配置
 # ---------------------------------------------------------------------------
-BLIP_REPO = "SCM1120/blip-fashion-finetuned"
-GPT2_REPO = "SCM1120/gpt2-ad-finetuned"
+VIT_GPT2_REPO = "nlpconnect/vit-gpt2-image-captioning"
+GPT2_REPO     = "SCM1120/gpt2-ad-finetuned"
 
 
 @st.cache_resource
 def load_models():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    blip_processor = BlipProcessor.from_pretrained(BLIP_REPO)
-    blip_model = BlipForConditionalGeneration.from_pretrained(BLIP_REPO).to(device)
+    # ---- 第一步：ViT-GPT2 图像描述模型 ----
+    vit_processor = ViTImageProcessor.from_pretrained(VIT_GPT2_REPO)
+    vit_tokenizer = AutoTokenizer.from_pretrained(VIT_GPT2_REPO)
+    vit_model     = VisionEncoderDecoderModel.from_pretrained(VIT_GPT2_REPO).to(device)
 
+    # ---- 第二步：微调 GPT-2 广告文案模型 ----
     gpt2_tokenizer = GPT2Tokenizer.from_pretrained(GPT2_REPO)
-    gpt2_tokenizer.pad_token = gpt2_tokenizer.eos_token
+    gpt2_tokenizer.pad_token    = gpt2_tokenizer.eos_token
     gpt2_tokenizer.padding_side = "left"
     gpt2_model = GPT2LMHeadModel.from_pretrained(GPT2_REPO).to(device)
 
-    return blip_processor, blip_model, gpt2_tokenizer, gpt2_model, device
+    return vit_processor, vit_tokenizer, vit_model, gpt2_tokenizer, gpt2_model, device
 
 
 def clean_ad_text(raw: str) -> str:
@@ -75,7 +79,7 @@ def clean_ad_text(raw: str) -> str:
 # ---------------------------------------------------------------------------
 # 加载模型
 # ---------------------------------------------------------------------------
-blip_processor, blip_model, gpt2_tokenizer, gpt2_model, device = load_models()
+vit_processor, vit_tokenizer, vit_model, gpt2_tokenizer, gpt2_model, device = load_models()
 
 # ---------------------------------------------------------------------------
 # 上传与展示
@@ -93,21 +97,21 @@ st.image(image, caption="上传的商品图片", use_container_width=True)
 st.divider()
 
 # ---------------------------------------------------------------------------
-# 第一步：BLIP 生成商品描述（无提示词 + 重复惩罚，与 step1 训练格式一致）
+# 第一步：ViT-GPT2 生成商品描述
 # ---------------------------------------------------------------------------
-# 你的 BLIP 是在时尚商品名上微调的，用「仅图像」生成更合适，加提示词易出现 "of of of"
-with st.spinner("正在生成商品描述（BLIP 微调模型）..."):
-    inputs = blip_processor(images=image, return_tensors="pt").to(device)
-    caption_ids = blip_model.generate(
-        **inputs,
-        max_new_tokens=40,
-        num_beams=5,
-        early_stopping=True,
-        repetition_penalty=1.5,
-    )
-    caption = blip_processor.decode(caption_ids[0], skip_special_tokens=True).strip()
+with st.spinner("正在生成商品描述（ViT-GPT2）..."):
+    pixel_values = vit_processor(images=image, return_tensors="pt").pixel_values.to(device)
+    with torch.no_grad():
+        caption_ids = vit_model.generate(
+            pixel_values,
+            max_new_tokens=40,
+            num_beams=4,
+            early_stopping=True,
+            repetition_penalty=1.5,
+        )
+    caption = vit_tokenizer.decode(caption_ids[0], skip_special_tokens=True).strip()
 
-# 过滤无效输出：空、纯标点、同一词重复（如 "of of of"）
+
 def _is_bad_caption(t: str) -> bool:
     if not t or len(t) < 2:
         return True
@@ -115,16 +119,17 @@ def _is_bad_caption(t: str) -> bool:
         return True
     words = t.lower().split()
     if len(words) >= 3 and len(set(words)) == 1:
-        return True  # 同一词重复
+        return True
     if len(words) <= 4 and len(set(words)) <= 2:
-        return True  # 极短且词很少，多半是 "of of of" 之类
+        return True
     return False
 
+
 if _is_bad_caption(caption):
-    caption = "商品"
+    caption = "product"
 product_desc = caption
 
-st.subheader("第一步：商品描述 (BLIP Image Captioning)")
+st.subheader("第一步：商品描述 (ViT-GPT2 Image Captioning)")
 st.success(f"描述: **{product_desc}**")
 
 # ---------------------------------------------------------------------------
@@ -156,6 +161,6 @@ else:
 # 技术逻辑说明
 # ---------------------------------------------------------------------------
 with st.expander("查看技术逻辑 (Technical Logic)"):
-    st.write("1. **BLIP（微调）**: Step1 在时尚商品数据上微调，从图片生成商品描述。")
+    st.write("1. **ViT-GPT2**: 使用 `nlpconnect/vit-gpt2-image-captioning`，从图片生成商品英文描述。")
     st.write(f"2. **Bridge**: 将描述「{product_desc}」按 Step2 格式构造 Product + Description + Ad。")
     st.write("3. **GPT-2（微调）**: Step2 在 Product-Descriptions-and-Ads 上微调，续写广告文案。")
